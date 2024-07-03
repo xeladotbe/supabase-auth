@@ -534,6 +534,8 @@ func (a *API) Provider(ctx context.Context, name string, scopes string) (provide
 		return provider.NewDiscordProvider(config.External.Discord, scopes)
 	case "facebook":
 		return provider.NewFacebookProvider(config.External.Facebook, scopes)
+	case "amazon":
+		return provider.NewAmazonProvider(config.External.Amazon, scopes)
 	case "figma":
 		return provider.NewFigmaProvider(config.External.Figma, scopes)
 	case "fly":

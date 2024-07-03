@@ -4,6 +4,7 @@ import "net/http"
 
 type ProviderSettings struct {
 	AnonymousUsers bool `json:"anonymous_users"`
+	Amazon         bool `json:"amazon"`
 	Apple          bool `json:"apple"`
 	Azure          bool `json:"azure"`
 	Bitbucket      bool `json:"bitbucket"`
@@ -46,6 +47,7 @@ func (a *API) Settings(w http.ResponseWriter, r *http.Request) error {
 	return sendJSON(w, http.StatusOK, &Settings{
 		ExternalProviders: ProviderSettings{
 			AnonymousUsers: config.External.AnonymousUsers.Enabled,
+			Amazon:         config.External.Amazon.Enabled,
 			Apple:          config.External.Apple.Enabled,
 			Azure:          config.External.Azure.Enabled,
 			Bitbucket:      config.External.Bitbucket.Enabled,
