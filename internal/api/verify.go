@@ -45,7 +45,7 @@ type VerifyParams struct {
 	RedirectTo string `json:"redirect_to"`
 }
 
-func (p *VerifyParams) Validate(r *http.Request) error {
+func (p *VerifyParams) Validate(r *http.Request, a *API) error {
 	var err error
 	if p.Type == "" {
 		return badRequestError(ErrorCodeValidationFailed, "Verify requires a verification type")
@@ -69,7 +69,7 @@ func (p *VerifyParams) Validate(r *http.Request) error {
 				}
 				p.TokenHash = crypto.GenerateTokenHash(p.Phone, p.Token)
 			} else if isEmailOtpVerification(p) {
-				p.Email, err = validateEmail(p.Email)
+				p.Email, err = a.validateEmail(p.Email)
 				if err != nil {
 					return unprocessableEntityError(ErrorCodeValidationFailed, "Invalid email format").WithInternalError(err)
 				}
@@ -96,7 +96,7 @@ func (a *API) Verify(w http.ResponseWriter, r *http.Request) error {
 		params.Token = r.FormValue("token")
 		params.Type = r.FormValue("type")
 		params.RedirectTo = utilities.GetReferrer(r, a.config)
-		if err := params.Validate(r); err != nil {
+		if err := params.Validate(r, a); err != nil {
 			return err
 		}
 		return a.verifyGet(w, r, params)
@@ -104,7 +104,7 @@ func (a *API) Verify(w http.ResponseWriter, r *http.Request) error {
 		if err := retrieveRequestParams(r, params); err != nil {
 			return err
 		}
-		if err := params.Validate(r); err != nil {
+		if err := params.Validate(r, a); err != nil {
 			return err
 		}
 		return a.verifyPost(w, r, params)
@@ -117,7 +117,6 @@ func (a *API) Verify(w http.ResponseWriter, r *http.Request) error {
 func (a *API) verifyGet(w http.ResponseWriter, r *http.Request, params *VerifyParams) error {
 	ctx := r.Context()
 	db := a.db.WithContext(ctx)
-	config := a.config
 
 	var (
 		user        *models.User
@@ -185,9 +184,6 @@ func (a *API) verifyGet(w http.ResponseWriter, r *http.Request, params *VerifyPa
 				return terr
 			}
 
-			if terr = a.setCookieTokens(config, token, false, w); terr != nil {
-				return internalServerError("Failed to set JWT cookie. %s", terr)
-			}
 		} else if isPKCEFlow(flowType) {
 			if authCode, terr = issueAuthCode(tx, user, authenticationMethod); terr != nil {
 				return badRequestError(ErrorCodeFlowStateNotFound, "No associated flow state found. %s", terr)
@@ -227,7 +223,6 @@ func (a *API) verifyGet(w http.ResponseWriter, r *http.Request, params *VerifyPa
 func (a *API) verifyPost(w http.ResponseWriter, r *http.Request, params *VerifyParams) error {
 	ctx := r.Context()
 	db := a.db.WithContext(ctx)
-	config := a.config
 
 	var (
 		user        *models.User
@@ -285,10 +280,6 @@ func (a *API) verifyPost(w http.ResponseWriter, r *http.Request, params *VerifyP
 		if terr != nil {
 			return terr
 		}
-
-		if terr = a.setCookieTokens(config, token, false, w); terr != nil {
-			return internalServerError("Failed to set JWT cookie. %s", terr)
-		}
 		return nil
 	})
 	if err != nil {
@@ -306,6 +297,7 @@ func (a *API) verifyPost(w http.ResponseWriter, r *http.Request, params *VerifyP
 func (a *API) signupVerify(r *http.Request, ctx context.Context, conn *storage.Connection, user *models.User) (*models.User, error) {
 	config := a.config
 
+	shouldUpdatePassword := false
 	if !user.HasPassword() && user.InvitedAt != nil {
 		// sign them up with temporary password, and require application
 		// to present the user with a password set form
@@ -318,11 +310,12 @@ func (a *API) signupVerify(r *http.Request, ctx context.Context, conn *storage.C
 		if err := user.SetPassword(ctx, password, config.Security.DBEncryption.Encrypt, config.Security.DBEncryption.EncryptionKeyID, config.Security.DBEncryption.EncryptionKey); err != nil {
 			return nil, err
 		}
+		shouldUpdatePassword = true
 	}
 
 	err := conn.Transaction(func(tx *storage.Connection) error {
 		var terr error
-		if !user.HasPassword() && user.InvitedAt != nil {
+		if shouldUpdatePassword {
 			if terr = user.UpdatePassword(tx, nil); terr != nil {
 				return internalServerError("Error storing password").WithInternalError(terr)
 			}
@@ -334,6 +327,25 @@ func (a *API) signupVerify(r *http.Request, ctx context.Context, conn *storage.C
 
 		if terr = user.Confirm(tx); terr != nil {
 			return internalServerError("Error confirming user").WithInternalError(terr)
+		}
+
+		// on signupVerify, the user will always only have an email identity
+		// so we can safely assume that the first identity is the email identity
+		//
+		// we still check for the length of the identities slice to be safe.
+		if len(user.Identities) != 0 {
+			if len(user.Identities) > 1 {
+				return internalServerError("User has more than one identity on signup")
+			}
+			emailIdentity := user.Identities[0]
+			if emailIdentity.Email != user.Email {
+				return internalServerError("User email identity does not match user email")
+			}
+			if terr = emailIdentity.UpdateIdentityData(tx, map[string]interface{}{
+				"email_verified": true,
+			}); terr != nil {
+				return internalServerError("Error updating email identity").WithInternalError(terr)
+			}
 		}
 		return nil
 	})
@@ -446,10 +458,10 @@ func (a *API) prepErrorRedirectURL(err *HTTPError, r *http.Request, rurl string,
 		hq.Set("error", str)
 		q.Set("error", str)
 	}
-	hq.Set("error_code", strconv.Itoa(err.HTTPStatus))
+	hq.Set("error_code", err.ErrorCode)
 	hq.Set("error_description", err.Message)
 
-	q.Set("error_code", strconv.Itoa(err.HTTPStatus))
+	q.Set("error_code", err.ErrorCode)
 	q.Set("error_description", err.Message)
 	if flowType == models.PKCEFlow {
 		// Additionally, may override existing error query param if set to PKCE.
@@ -489,7 +501,10 @@ func (a *API) prepPKCERedirectURL(rurl, code string) (string, error) {
 
 func (a *API) emailChangeVerify(r *http.Request, conn *storage.Connection, params *VerifyParams, user *models.User) (*models.User, error) {
 	config := a.config
-	if config.Mailer.SecureEmailChangeEnabled && user.EmailChangeConfirmStatus == zeroConfirmation && user.GetEmail() != "" {
+	if !config.Mailer.Autoconfirm &&
+		config.Mailer.SecureEmailChangeEnabled &&
+		user.EmailChangeConfirmStatus == zeroConfirmation &&
+		user.GetEmail() != "" {
 		err := conn.Transaction(func(tx *storage.Connection) error {
 			currentOTT, terr := models.FindOneTimeToken(tx, params.TokenHash, models.EmailChangeTokenCurrent)
 			if terr != nil && !models.IsNotFoundError(terr) {
@@ -683,6 +698,12 @@ func (a *API) verifyUserAndToken(conn *storage.Connection, params *VerifyParams,
 		isValid = isOtpValid(tokenHash, user.EmailChangeTokenCurrent, user.EmailChangeSentAt, config.Mailer.OtpExp) ||
 			isOtpValid(tokenHash, user.EmailChangeTokenNew, user.EmailChangeSentAt, config.Mailer.OtpExp)
 	case phoneChangeVerification, smsVerification:
+		if testOTP, ok := config.Sms.GetTestOTP(params.Phone, time.Now()); ok {
+			if params.Token == testOTP {
+				return user, nil
+			}
+		}
+
 		phone := params.Phone
 		sentAt := user.ConfirmationSentAt
 		expectedToken := user.ConfirmationToken
@@ -691,12 +712,8 @@ func (a *API) verifyUserAndToken(conn *storage.Connection, params *VerifyParams,
 			sentAt = user.PhoneChangeSentAt
 			expectedToken = user.PhoneChangeToken
 		}
-		if config.Sms.IsTwilioVerifyProvider() {
-			if testOTP, ok := config.Sms.GetTestOTP(params.Phone, time.Now()); ok {
-				if params.Token == testOTP {
-					return user, nil
-				}
-			}
+
+		if !config.Hook.SendSMS.Enabled && config.Sms.IsTwilioVerifyProvider() {
 			if err := smsProvider.(*sms_provider.TwilioVerifyProvider).VerifyOTP(phone, params.Token); err != nil {
 				return nil, forbiddenError(ErrorCodeOTPExpired, "Token has expired or is invalid").WithInternalError(err)
 			}
@@ -720,7 +737,7 @@ func isOtpValid(actual, expected string, sentAt *time.Time, otpExp uint) bool {
 }
 
 func isOtpExpired(sentAt *time.Time, otpExp uint) bool {
-	return time.Now().After(sentAt.Add(time.Second * time.Duration(otpExp)))
+	return time.Now().After(sentAt.Add(time.Second * time.Duration(otpExp))) // #nosec G115
 }
 
 // isPhoneOtpVerification checks if the verification came from a phone otp

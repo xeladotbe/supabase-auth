@@ -47,28 +47,34 @@ func (a *API) RefreshTokenGrant(ctx context.Context, w http.ResponseWriter, r *h
 		user, token, session, err := models.FindUserWithRefreshToken(db, params.RefreshToken, false)
 		if err != nil {
 			if models.IsNotFoundError(err) {
-				return oauthError("invalid_grant", "Invalid Refresh Token: Refresh Token Not Found")
+				return badRequestError(ErrorCodeRefreshTokenNotFound, "Invalid Refresh Token: Refresh Token Not Found")
 			}
 			return internalServerError(err.Error())
 		}
 
 		if user.IsBanned() {
-			return oauthError("invalid_grant", "Invalid Refresh Token: User Banned")
+			return badRequestError(ErrorCodeUserBanned, "Invalid Refresh Token: User Banned")
 		}
 
-		if session != nil {
-			result := session.CheckValidity(retryStart, &token.UpdatedAt, config.Sessions.Timebox, config.Sessions.InactivityTimeout)
-
-			switch result {
-			case models.SessionValid:
-				// do nothing
-
-			case models.SessionTimedOut:
-				return oauthError("invalid_grant", "Invalid Refresh Token: Session Expired (Inactivity)")
-
-			default:
-				return oauthError("invalid_grant", "Invalid Refresh Token: Session Expired")
+		if session == nil {
+			// a refresh token won't have a session if it's created prior to the sessions table introduced
+			if err := db.Destroy(token); err != nil {
+				return internalServerError("Error deleting refresh token with missing session").WithInternalError(err)
 			}
+			return badRequestError(ErrorCodeSessionNotFound, "Invalid Refresh Token: No Valid Session Found")
+		}
+
+		result := session.CheckValidity(retryStart, &token.UpdatedAt, config.Sessions.Timebox, config.Sessions.InactivityTimeout)
+
+		switch result {
+		case models.SessionValid:
+			// do nothing
+
+		case models.SessionTimedOut:
+			return badRequestError(ErrorCodeSessionExpired, "Invalid Refresh Token: Session Expired (Inactivity)")
+
+		default:
+			return badRequestError(ErrorCodeSessionExpired, "Invalid Refresh Token: Session Expired")
 		}
 
 		// Basic checks above passed, now we need to serialize access
@@ -147,7 +153,7 @@ func (a *API) RefreshTokenGrant(ctx context.Context, w http.ResponseWriter, r *h
 					if s.LastRefreshedAt(nil).After(session.LastRefreshedAt(&token.UpdatedAt)) {
 						// session is not the most
 						// recently active one
-						return oauthError("invalid_grant", "Invalid Refresh Token: Session Expired (Revoked by Newer Login)")
+						return badRequestError(ErrorCodeSessionExpired, "Invalid Refresh Token: Session Expired (Revoked by Newer Login)")
 					}
 				}
 
@@ -182,9 +188,7 @@ func (a *API) RefreshTokenGrant(ctx context.Context, w http.ResponseWriter, r *h
 						time.Second * time.Duration(config.Security.RefreshTokenReuseInterval))
 
 					if a.Now().After(reuseUntil) {
-						a.clearCookieTokens(config, w)
 						// not OK to reuse this token
-
 						if config.Security.RefreshTokenRotationEnabled {
 							// Revoke all tokens in token family
 							if err := models.RevokeTokenFamily(tx, token); err != nil {
@@ -192,7 +196,7 @@ func (a *API) RefreshTokenGrant(ctx context.Context, w http.ResponseWriter, r *h
 							}
 						}
 
-						return storage.NewCommitWithError(oauthError("invalid_grant", "Invalid Refresh Token: Already Used").WithInternalMessage("Possible abuse attempt: %v", token.ID))
+						return storage.NewCommitWithError(badRequestError(ErrorCodeRefreshTokenAlreadyUsed, "Invalid Refresh Token: Already Used").WithInternalMessage("Possible abuse attempt: %v", token.ID))
 					}
 				}
 			}
@@ -247,9 +251,6 @@ func (a *API) RefreshTokenGrant(ctx context.Context, w http.ResponseWriter, r *h
 				ExpiresAt:    expiresAt,
 				RefreshToken: issuedToken.Token,
 				User:         user,
-			}
-			if terr = a.setCookieTokens(config, newTokenResponse, false, w); terr != nil {
-				return internalServerError("Failed to set JWT cookie. %s", terr)
 			}
 
 			return nil

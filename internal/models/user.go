@@ -9,11 +9,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/gobuffalo/pop/v6"
 	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
 	"github.com/supabase/auth/internal/crypto"
 	"github.com/supabase/auth/internal/storage"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // User respresents a registered user with email/password authentication
@@ -69,6 +71,36 @@ type User struct {
 	IsAnonymous bool       `json:"is_anonymous" db:"is_anonymous"`
 
 	DONTUSEINSTANCEID uuid.UUID `json:"-" db:"instance_id"`
+}
+
+func NewUserWithPasswordHash(phone, email, passwordHash, aud string, userData map[string]interface{}) (*User, error) {
+	if strings.HasPrefix(passwordHash, crypto.Argon2Prefix) {
+		_, err := crypto.ParseArgon2Hash(passwordHash)
+		if err != nil {
+			return nil, err
+		}
+	} else if strings.HasPrefix(passwordHash, crypto.FirebaseScryptPrefix) {
+		_, err := crypto.ParseFirebaseScryptHash(passwordHash)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// verify that the hash is a bcrypt hash
+		_, err := bcrypt.Cost([]byte(passwordHash))
+		if err != nil {
+			return nil, err
+		}
+	}
+	id := uuid.Must(uuid.NewV4())
+	user := &User{
+		ID:                id,
+		Aud:               aud,
+		Email:             storage.NullString(strings.ToLower(email)),
+		Phone:             storage.NullString(phone),
+		UserMetaData:      userData,
+		EncryptedPassword: &passwordHash,
+	}
+	return user, nil
 }
 
 // NewUser initializes a new user from an email, password and user data.
@@ -351,12 +383,16 @@ func (u *User) UpdatePassword(tx *storage.Connection, sessionID *uuid.UUID) erro
 }
 
 // Authenticate a user from a password
-func (u *User) Authenticate(ctx context.Context, password string, decryptionKeys map[string]string, encrypt bool, encryptionKeyID string) (bool, bool, error) {
+func (u *User) Authenticate(ctx context.Context, tx *storage.Connection, password string, decryptionKeys map[string]string, encrypt bool, encryptionKeyID string) (bool, bool, error) {
 	if u.EncryptedPassword == nil {
 		return false, false, nil
 	}
 
 	hash := *u.EncryptedPassword
+
+	if hash == "" {
+		return false, false, nil
+	}
 
 	es := crypto.ParseEncryptedString(hash)
 	if es != nil {
@@ -369,6 +405,22 @@ func (u *User) Authenticate(ctx context.Context, password string, decryptionKeys
 	}
 
 	compareErr := crypto.CompareHashAndPassword(ctx, hash, password)
+
+	if !strings.HasPrefix(hash, crypto.Argon2Prefix) && !strings.HasPrefix(hash, crypto.FirebaseScryptPrefix) {
+		// check if cost exceeds default cost or is too low
+		cost, err := bcrypt.Cost([]byte(hash))
+		if err != nil {
+			return compareErr == nil, false, err
+		}
+
+		if cost > bcrypt.DefaultCost || cost == bcrypt.MinCost {
+			// don't bother with encrypting the password in Authenticate
+			// since it's handled separately
+			if err := u.SetPassword(ctx, password, false, "", ""); err != nil {
+				return compareErr == nil, false, err
+			}
+		}
+	}
 
 	return compareErr == nil, encrypt && (es == nil || es.ShouldReEncrypt(encryptionKeyID)), nil
 }
@@ -394,6 +446,12 @@ func (u *User) Confirm(tx *storage.Connection) error {
 	u.EmailConfirmedAt = &now
 
 	if err := tx.UpdateOnly(u, "confirmation_token", "email_confirmed_at"); err != nil {
+		return err
+	}
+
+	if err := u.UpdateUserMetaData(tx, map[string]interface{}{
+		"email_verified": true,
+	}); err != nil {
 		return err
 	}
 
@@ -637,8 +695,8 @@ func FindUsersInAudience(tx *storage.Connection, aud string, pageParams *Paginat
 
 	var err error
 	if pageParams != nil {
-		err = q.Paginate(int(pageParams.Page), int(pageParams.PerPage)).All(&users)
-		pageParams.Count = uint64(q.Paginator.TotalEntriesSize)
+		err = q.Paginate(int(pageParams.Page), int(pageParams.PerPage)).All(&users) // #nosec G115
+		pageParams.Count = uint64(q.Paginator.TotalEntriesSize)                     // #nosec G115
 	} else {
 		err = q.All(&users)
 	}
@@ -724,6 +782,16 @@ func (u *User) IsBanned() bool {
 		return false
 	}
 	return time.Now().Before(*u.BannedUntil)
+}
+
+func (u *User) HasMFAEnabled() bool {
+	for _, factor := range u.Factors {
+		if factor.IsVerified() {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (u *User) UpdateBannedUntil(tx *storage.Connection) error {
@@ -858,6 +926,43 @@ func (u *User) SoftDeleteUserIdentities(tx *storage.Connection) error {
 		}
 	}
 	return nil
+}
+
+func (u *User) FindOwnedFactorByID(tx *storage.Connection, factorID uuid.UUID) (*Factor, error) {
+	var factor Factor
+	err := tx.Where("user_id = ? AND id = ?", u.ID, factorID).First(&factor)
+	if err != nil {
+		if errors.Cause(err) == sql.ErrNoRows {
+			return nil, &FactorNotFoundError{}
+		}
+		return nil, err
+	}
+	return &factor, nil
+}
+
+func (user *User) WebAuthnID() []byte {
+	return []byte(user.ID.String())
+}
+
+func (user *User) WebAuthnName() string {
+	return user.Email.String()
+}
+
+func (user *User) WebAuthnDisplayName() string {
+	return user.Email.String()
+}
+
+func (user *User) WebAuthnCredentials() []webauthn.Credential {
+	var credentials []webauthn.Credential
+
+	for _, factor := range user.Factors {
+		if factor.IsVerified() && factor.FactorType == WebAuthn {
+			credential := factor.WebAuthnCredential.Credential
+			credentials = append(credentials, credential)
+		}
+	}
+
+	return credentials
 }
 
 func obfuscateValue(id uuid.UUID, value string) string {

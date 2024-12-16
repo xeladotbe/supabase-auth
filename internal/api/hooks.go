@@ -10,7 +10,6 @@ import (
 	"mime"
 	"net"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -138,32 +137,34 @@ func (a *API) runHTTPHook(r *http.Request, hookConfig conf.ExtensibilityPointCon
 		}
 
 		defer rsp.Body.Close()
-		// Header.Get is case insensitive
-		contentType := rsp.Header.Get("Content-Type")
-		mediaType, _, err := mime.ParseMediaType(contentType)
-		if err != nil {
-			return nil, internalServerError("Invalid Content-Type header")
-		}
-		if mediaType != "application/json" {
-			return nil, internalServerError("Invalid JSON response. Received content-type: " + contentType)
-		}
 
 		switch rsp.StatusCode {
 		case http.StatusOK, http.StatusNoContent, http.StatusAccepted:
+			// Header.Get is case insensitive
+			contentType := rsp.Header.Get("Content-Type")
+			if contentType == "" {
+				return nil, badRequestError(ErrorCodeHookPayloadInvalidContentType, "Invalid Content-Type: Missing Content-Type header")
+			}
+			mediaType, _, err := mime.ParseMediaType(contentType)
+			if err != nil {
+				return nil, badRequestError(ErrorCodeHookPayloadInvalidContentType, fmt.Sprintf("Invalid Content-Type header: %s", err.Error()))
+			}
+			if mediaType != "application/json" {
+				return nil, badRequestError(ErrorCodeHookPayloadInvalidContentType, "Invalid JSON response. Received content-type: "+contentType)
+			}
 			if rsp.Body == nil {
 				return nil, nil
 			}
-			contentLength := rsp.ContentLength
-			if contentLength == -1 {
-				return nil, unprocessableEntityError(ErrorCodeHookPayloadUnknownSize, "Payload size not known")
-			}
-			if contentLength >= PayloadLimit {
-				return nil, unprocessableEntityError(ErrorCodeHookPayloadOverSizeLimit, fmt.Sprintf("Payload size is: %d bytes exceeded size limit of %d bytes", contentLength, PayloadLimit))
-			}
-			limitedReader := io.LimitedReader{R: rsp.Body, N: contentLength}
+			limitedReader := io.LimitedReader{R: rsp.Body, N: PayloadLimit}
 			body, err := io.ReadAll(&limitedReader)
 			if err != nil {
 				return nil, err
+			}
+			if limitedReader.N <= 0 {
+				// check if the response body still has excess bytes to be read
+				if n, _ := rsp.Body.Read(make([]byte, 1)); n > 0 {
+					return nil, unprocessableEntityError(ErrorCodeHookPayloadOverSizeLimit, fmt.Sprintf("Payload size exceeded size limit of %d bytes", PayloadLimit))
+				}
 			}
 			return body, nil
 		case http.StatusTooManyRequests, http.StatusServiceUnavailable:
@@ -178,7 +179,7 @@ func (a *API) runHTTPHook(r *http.Request, hookConfig conf.ExtensibilityPointCon
 		case http.StatusUnauthorized:
 			return nil, internalServerError("Hook requires authorization token")
 		default:
-			return nil, internalServerError("Error executing Hook")
+			return nil, internalServerError("Unexpected status code returned from hook: %d", rsp.StatusCode)
 		}
 	}
 	return nil, nil
@@ -188,13 +189,9 @@ func (a *API) runHTTPHook(r *http.Request, hookConfig conf.ExtensibilityPointCon
 // transaction is opened. If calling invokeHook within a transaction, always
 // pass the current transaction, as pool-exhaustion deadlocks are very easy to
 // trigger.
-func (a *API) invokeHook(conn *storage.Connection, r *http.Request, input, output any, uri string) error {
+func (a *API) invokeHook(conn *storage.Connection, r *http.Request, input, output any) error {
 	var err error
 	var response []byte
-	u, err := url.Parse(uri)
-	if err != nil {
-		return err
-	}
 
 	switch input.(type) {
 	case *hooks.SendSMSInput:
@@ -202,7 +199,7 @@ func (a *API) invokeHook(conn *storage.Connection, r *http.Request, input, outpu
 		if !ok {
 			panic("output should be *hooks.SendSMSOutput")
 		}
-		if response, err = a.runHook(r, conn, a.config.Hook.SendSMS, input, output, u.Scheme); err != nil {
+		if response, err = a.runHook(r, conn, a.config.Hook.SendSMS, input, output); err != nil {
 			return err
 		}
 		if err := json.Unmarshal(response, hookOutput); err != nil {
@@ -226,7 +223,7 @@ func (a *API) invokeHook(conn *storage.Connection, r *http.Request, input, outpu
 		if !ok {
 			panic("output should be *hooks.SendEmailOutput")
 		}
-		if response, err = a.runHook(r, conn, a.config.Hook.SendEmail, input, output, u.Scheme); err != nil {
+		if response, err = a.runHook(r, conn, a.config.Hook.SendEmail, input, output); err != nil {
 			return err
 		}
 		if err := json.Unmarshal(response, hookOutput); err != nil {
@@ -252,7 +249,7 @@ func (a *API) invokeHook(conn *storage.Connection, r *http.Request, input, outpu
 		if !ok {
 			panic("output should be *hooks.MFAVerificationAttemptOutput")
 		}
-		if response, err = a.runHook(r, conn, a.config.Hook.MFAVerificationAttempt, input, output, u.Scheme); err != nil {
+		if response, err = a.runHook(r, conn, a.config.Hook.MFAVerificationAttempt, input, output); err != nil {
 			return err
 		}
 		if err := json.Unmarshal(response, hookOutput); err != nil {
@@ -279,7 +276,7 @@ func (a *API) invokeHook(conn *storage.Connection, r *http.Request, input, outpu
 			panic("output should be *hooks.PasswordVerificationAttemptOutput")
 		}
 
-		if response, err = a.runHook(r, conn, a.config.Hook.PasswordVerificationAttempt, input, output, u.Scheme); err != nil {
+		if response, err = a.runHook(r, conn, a.config.Hook.PasswordVerificationAttempt, input, output); err != nil {
 			return err
 		}
 		if err := json.Unmarshal(response, hookOutput); err != nil {
@@ -306,7 +303,7 @@ func (a *API) invokeHook(conn *storage.Connection, r *http.Request, input, outpu
 		if !ok {
 			panic("output should be *hooks.CustomAccessTokenOutput")
 		}
-		if response, err = a.runHook(r, conn, a.config.Hook.CustomAccessToken, input, output, u.Scheme); err != nil {
+		if response, err = a.runHook(r, conn, a.config.Hook.CustomAccessToken, input, output); err != nil {
 			return err
 		}
 		if err := json.Unmarshal(response, hookOutput); err != nil {
@@ -345,20 +342,43 @@ func (a *API) invokeHook(conn *storage.Connection, r *http.Request, input, outpu
 	return nil
 }
 
-func (a *API) runHook(r *http.Request, conn *storage.Connection, hookConfig conf.ExtensibilityPointConfiguration, input, output any, scheme string) ([]byte, error) {
+func (a *API) runHook(r *http.Request, conn *storage.Connection, hookConfig conf.ExtensibilityPointConfiguration, input, output any) ([]byte, error) {
 	ctx := r.Context()
+
+	logEntry := observability.GetLogEntry(r)
+	hookStart := time.Now()
+
 	var response []byte
 	var err error
-	switch strings.ToLower(scheme) {
-	case "http", "https":
+
+	switch {
+	case strings.HasPrefix(hookConfig.URI, "http:") || strings.HasPrefix(hookConfig.URI, "https:"):
 		response, err = a.runHTTPHook(r, hookConfig, input)
-	case "pg-functions":
+	case strings.HasPrefix(hookConfig.URI, "pg-functions:"):
 		response, err = a.runPostgresHook(ctx, conn, hookConfig, input, output)
 	default:
-		return nil, fmt.Errorf("unsupported protocol: %v only postgres hooks and HTTPS functions are supported at the moment", scheme)
+		return nil, fmt.Errorf("unsupported protocol: %q only postgres hooks and HTTPS functions are supported at the moment", hookConfig.URI)
 	}
+
+	duration := time.Since(hookStart)
+
 	if err != nil {
+		logEntry.Entry.WithFields(logrus.Fields{
+			"action":   "run_hook",
+			"hook":     hookConfig.URI,
+			"success":  false,
+			"duration": duration.Microseconds(),
+		}).WithError(err).Warn("Hook errored out")
+
 		return nil, internalServerError("Error running hook URI: %v", hookConfig.URI).WithInternalError(err)
 	}
+
+	logEntry.Entry.WithFields(logrus.Fields{
+		"action":   "run_hook",
+		"hook":     hookConfig.URI,
+		"success":  true,
+		"duration": duration.Microseconds(),
+	}).WithError(err).Info("Hook ran successfully")
+
 	return response, nil
 }

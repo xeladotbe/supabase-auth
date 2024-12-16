@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -14,7 +13,6 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/xeipuuv/gojsonschema"
 
-	"github.com/supabase/auth/internal/conf"
 	"github.com/supabase/auth/internal/hooks"
 	"github.com/supabase/auth/internal/metering"
 	"github.com/supabase/auth/internal/models"
@@ -91,7 +89,7 @@ func (a *API) Token(w http.ResponseWriter, r *http.Request) error {
 	case "pkce":
 		return a.PKCE(ctx, w, r)
 	default:
-		return oauthError("unsupported_grant_type", "")
+		return badRequestError(ErrorCodeInvalidCredentials, "unsupported_grant_type")
 	}
 }
 
@@ -131,21 +129,25 @@ func (a *API) ResourceOwnerPasswordGrant(ctx context.Context, w http.ResponseWri
 		params.Phone = formatPhoneNumber(params.Phone)
 		user, err = models.FindUserByPhoneAndAudience(db, params.Phone, aud)
 	} else {
-		return oauthError("invalid_grant", InvalidLoginMessage)
+		return badRequestError(ErrorCodeValidationFailed, "missing email or phone")
 	}
 
 	if err != nil {
 		if models.IsNotFoundError(err) {
-			return oauthError("invalid_grant", InvalidLoginMessage)
+			return badRequestError(ErrorCodeInvalidCredentials, InvalidLoginMessage)
 		}
 		return internalServerError("Database error querying schema").WithInternalError(err)
 	}
 
-	if user.IsBanned() {
-		return oauthError("invalid_grant", InvalidLoginMessage)
+	if !user.HasPassword() {
+		return badRequestError(ErrorCodeInvalidCredentials, InvalidLoginMessage)
 	}
 
-	isValidPassword, shouldReEncrypt, err := user.Authenticate(ctx, params.Password, config.Security.DBEncryption.DecryptionKeys, config.Security.DBEncryption.Encrypt, config.Security.DBEncryption.EncryptionKeyID)
+	if user.IsBanned() {
+		return badRequestError(ErrorCodeUserBanned, "User is banned")
+	}
+
+	isValidPassword, shouldReEncrypt, err := user.Authenticate(ctx, db, params.Password, config.Security.DBEncryption.DecryptionKeys, config.Security.DBEncryption.Encrypt, config.Security.DBEncryption.EncryptionKeyID)
 	if err != nil {
 		return err
 	}
@@ -181,8 +183,7 @@ func (a *API) ResourceOwnerPasswordGrant(ctx context.Context, w http.ResponseWri
 			Valid:  isValidPassword,
 		}
 		output := hooks.PasswordVerificationAttemptOutput{}
-		err := a.invokeHook(nil, r, &input, &output, a.config.Hook.PasswordVerificationAttempt.URI)
-		if err != nil {
+		if err := a.invokeHook(nil, r, &input, &output); err != nil {
 			return err
 		}
 
@@ -195,17 +196,17 @@ func (a *API) ResourceOwnerPasswordGrant(ctx context.Context, w http.ResponseWri
 					return err
 				}
 			}
-			return oauthError("invalid_grant", InvalidLoginMessage)
+			return badRequestError(ErrorCodeInvalidCredentials, output.Message)
 		}
 	}
 	if !isValidPassword {
-		return oauthError("invalid_grant", InvalidLoginMessage)
+		return badRequestError(ErrorCodeInvalidCredentials, InvalidLoginMessage)
 	}
 
 	if params.Email != "" && !user.IsConfirmed() {
-		return oauthError("invalid_grant", "Email not confirmed")
+		return badRequestError(ErrorCodeEmailNotConfirmed, "Email not confirmed")
 	} else if params.Phone != "" && !user.IsPhoneConfirmed() {
-		return oauthError("invalid_grant", "Phone not confirmed")
+		return badRequestError(ErrorCodePhoneNotConfirmed, "Phone not confirmed")
 	}
 
 	var token *AccessTokenResponse
@@ -221,9 +222,6 @@ func (a *API) ResourceOwnerPasswordGrant(ctx context.Context, w http.ResponseWri
 			return terr
 		}
 
-		if terr = a.setCookieTokens(config, token, false, w); terr != nil {
-			return internalServerError("Failed to set JWT cookie. %s", terr)
-		}
 		return nil
 	})
 	if err != nil {
@@ -271,7 +269,7 @@ func (a *API) PKCE(ctx context.Context, w http.ResponseWriter, r *http.Request) 
 		return err
 	}
 	if err := flowState.VerifyPKCE(params.CodeVerifier); err != nil {
-		return badRequestError(ErrorBadCodeVerifier, err.Error())
+		return badRequestError(ErrorCodeBadCodeVerifier, err.Error())
 	}
 
 	var token *AccessTokenResponse
@@ -288,7 +286,8 @@ func (a *API) PKCE(ctx context.Context, w http.ResponseWriter, r *http.Request) 
 		}
 		token, terr = a.issueRefreshToken(r, tx, user, authMethod, grantParams)
 		if terr != nil {
-			return oauthError("server_error", terr.Error())
+			// error type is already handled in issueRefreshToken
+			return terr
 		}
 		token.ProviderAccessToken = flowState.ProviderAccessToken
 		// Because not all providers give out a refresh token
@@ -329,7 +328,7 @@ func (a *API) generateAccessToken(r *http.Request, tx *storage.Connection, user 
 	claims := &hooks.AccessTokenClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   user.ID.String(),
-			Audience:  []string{user.Aud},
+			Audience:  jwt.ClaimStrings{user.Aud},
 			IssuedAt:  jwt.NewNumericDate(issuedAt),
 			ExpiresAt: jwt.NewNumericDate(expiresAt),
 			Issuer:    config.JWT.Issuer,
@@ -345,7 +344,7 @@ func (a *API) generateAccessToken(r *http.Request, tx *storage.Connection, user 
 		IsAnonymous:                   user.IsAnonymous,
 	}
 
-	var token *jwt.Token
+	var gotrueClaims jwt.Claims = claims
 	if config.Hook.CustomAccessToken.Enabled {
 		input := hooks.CustomAccessTokenInput{
 			UserID:               user.ID,
@@ -355,27 +354,14 @@ func (a *API) generateAccessToken(r *http.Request, tx *storage.Connection, user 
 
 		output := hooks.CustomAccessTokenOutput{}
 
-		err := a.invokeHook(tx, r, &input, &output, a.config.Hook.CustomAccessToken.URI)
+		err := a.invokeHook(tx, r, &input, &output)
 		if err != nil {
 			return "", 0, err
 		}
-		goTrueClaims := jwt.MapClaims(output.Claims)
-
-		token = jwt.NewWithClaims(jwt.SigningMethodHS256, goTrueClaims)
-
-	} else {
-		token = jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+		gotrueClaims = jwt.MapClaims(output.Claims)
 	}
 
-	if config.JWT.KeyID != "" {
-		if token.Header == nil {
-			token.Header = make(map[string]interface{})
-		}
-
-		token.Header["kid"] = config.JWT.KeyID
-	}
-
-	signed, err := token.SignedString([]byte(config.JWT.Secret))
+	signed, err := signJwt(&config.JWT, gotrueClaims)
 	if err != nil {
 		return "", 0, err
 	}
@@ -472,7 +458,7 @@ func (a *API) updateMFASessionAndClaims(r *http.Request, tx *storage.Connection,
 			return err
 		}
 
-		tokenString, expiresAt, terr = a.generateAccessToken(r, tx, user, &session.ID, models.TOTPSignIn)
+		tokenString, expiresAt, terr = a.generateAccessToken(r, tx, user, &session.ID, authenticationMethod)
 		if terr != nil {
 			httpErr, ok := terr.(*HTTPError)
 			if ok {
@@ -493,59 +479,6 @@ func (a *API) updateMFASessionAndClaims(r *http.Request, tx *storage.Connection,
 		RefreshToken: refreshToken.Token,
 		User:         user,
 	}, nil
-}
-
-// setCookieTokens sets the access_token & refresh_token in the cookies
-func (a *API) setCookieTokens(config *conf.GlobalConfiguration, token *AccessTokenResponse, session bool, w http.ResponseWriter) error {
-	// don't need to catch error here since we always set the cookie name
-	_ = a.setCookieToken(config, "access-token", token.Token, session, w)
-	_ = a.setCookieToken(config, "refresh-token", token.RefreshToken, session, w)
-	return nil
-}
-
-func (a *API) setCookieToken(config *conf.GlobalConfiguration, name string, tokenString string, session bool, w http.ResponseWriter) error {
-	if name == "" {
-		return errors.New("failed to set cookie, invalid name")
-	}
-	cookieName := config.Cookie.Key + "-" + name
-	exp := time.Second * time.Duration(config.Cookie.Duration)
-	cookie := &http.Cookie{
-		Name:     cookieName,
-		Value:    tokenString,
-		Secure:   true,
-		HttpOnly: true,
-		Path:     "/",
-		Domain:   config.Cookie.Domain,
-	}
-	if !session {
-		cookie.Expires = time.Now().Add(exp)
-		cookie.MaxAge = config.Cookie.Duration
-	}
-
-	http.SetCookie(w, cookie)
-	return nil
-}
-
-func (a *API) clearCookieTokens(config *conf.GlobalConfiguration, w http.ResponseWriter) {
-	a.clearCookieToken(config, "access-token", w)
-	a.clearCookieToken(config, "refresh-token", w)
-}
-
-func (a *API) clearCookieToken(config *conf.GlobalConfiguration, name string, w http.ResponseWriter) {
-	cookieName := config.Cookie.Key
-	if name != "" {
-		cookieName += "-" + name
-	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     cookieName,
-		Value:    "",
-		Expires:  time.Now().Add(-1 * time.Hour * 10),
-		MaxAge:   -1,
-		Secure:   true,
-		HttpOnly: true,
-		Path:     "/",
-		Domain:   config.Cookie.Domain,
-	})
 }
 
 func validateTokenClaims(outputClaims map[string]interface{}) error {

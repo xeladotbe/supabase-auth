@@ -80,6 +80,12 @@ func (p *IdTokenGrantParams) getProvider(ctx context.Context, config *conf.Globa
 		issuer = provider.IssuerKakao
 		acceptableClientIDs = append(acceptableClientIDs, config.External.Kakao.ClientID...)
 
+	case p.Provider == "vercel_marketplace" || p.Issuer == provider.IssuerVercelMarketplace:
+		cfg = &config.External.VercelMarketplace
+		providerType = "vercel_marketplace"
+		issuer = provider.IssuerVercelMarketplace
+		acceptableClientIDs = append(acceptableClientIDs, config.External.VercelMarketplace.ClientID...)
+
 	default:
 		log.WithField("issuer", p.Issuer).WithField("client_id", p.ClientID).Warn("Use of POST /token with arbitrary issuer and client_id is deprecated for security reasons. Please switch to using the API with provider only!")
 
@@ -235,6 +241,8 @@ func (a *API) IdTokenGrant(ctx context.Context, w http.ResponseWriter, r *http.R
 	}); err != nil {
 		switch err.(type) {
 		case *storage.CommitWithError:
+			return err
+		case *HTTPError:
 			return err
 		default:
 			return oauthError("server_error", "Internal Server Error").WithInternalError(err)
