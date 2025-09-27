@@ -401,6 +401,7 @@ type NotificationsConfiguration struct {
 
 type ProviderConfiguration struct {
 	AnonymousUsers          AnonymousProviderConfiguration `json:"anonymous_users" split_words:"true"`
+	Amazon                  OAuthProviderConfiguration     `json:"amazon"`
 	Apple                   OAuthProviderConfiguration     `json:"apple"`
 	Azure                   OAuthProviderConfiguration     `json:"azure"`
 	Bitbucket               OAuthProviderConfiguration     `json:"bitbucket"`

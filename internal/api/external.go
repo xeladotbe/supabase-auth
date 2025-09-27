@@ -608,6 +608,9 @@ func (a *API) Provider(ctx context.Context, name string, scopes string) (provide
 	case "facebook":
 		pConfig = config.External.Facebook
 		p, err = provider.NewFacebookProvider(pConfig, scopes)
+	case "amazon":
+		pConfig = config.External.Amazon
+		p, err = provider.NewAmazonProvider(pConfig, scopes)
 	case "figma":
 		pConfig = config.External.Figma
 		p, err = provider.NewFigmaProvider(pConfig, scopes)
