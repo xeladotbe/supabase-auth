@@ -1,11 +1,15 @@
 package api
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"testing"
 
+	"github.com/gofrs/uuid"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"github.com/supabase/auth/internal/conf"
@@ -202,6 +206,8 @@ func assertAuthorizationSuccess(ts *ExternalTestSuite, u *url.URL, tokenCount in
 	ts.NotEmpty(v.Get("refresh_token"))
 	ts.NotEmpty(v.Get("expires_in"))
 	ts.Equal("bearer", v.Get("token_type"))
+	// Verify Supabase Auth identifier is present
+	ts.Contains(v, "sb", "Fragment should contain Supabase Auth identifier 'sb'")
 
 	ts.Equal(1, tokenCount)
 	if userCount > -1 {
@@ -243,11 +249,29 @@ func assertAuthorizationFailure(ts *ExternalTestSuite, u *url.URL, errorDescript
 	ts.Empty(v.Get("refresh_token"))
 	ts.Empty(v.Get("expires_in"))
 	ts.Empty(v.Get("token_type"))
+	// Verify Supabase Auth identifier is present even in error responses
+	ts.Contains(v, "sb", "Fragment should contain Supabase Auth identifier 'sb' even in errors")
 
 	// ensure user is nil
 	user, err := models.FindUserByEmailAndAudience(ts.API.db, email, ts.Config.JWT.Aud)
 	ts.Require().Error(err, "User not found")
 	ts.Require().Nil(user)
+}
+
+// assertValidOAuthState verifies that the state parameter is a valid UUID
+// and that a corresponding flow_state record exists in the database with the correct provider.
+func assertValidOAuthState(ts *ExternalTestSuite, state string, expectedProvider string) {
+	ts.Require().NotEmpty(state, "state should not be empty")
+
+	// Verify state is a valid UUID
+	stateUUID, err := uuid.FromString(state)
+	require.NoError(ts.T(), err, "state should be a valid UUID")
+	require.NotEqual(ts.T(), uuid.Nil, stateUUID, "state UUID should not be nil")
+
+	// Verify flow state exists in database with correct provider
+	flowState, err := models.FindFlowStateByID(ts.API.db, stateUUID.String())
+	require.NoError(ts.T(), err, "flow state should exist in database")
+	ts.Equal(expectedProvider, flowState.ProviderType, "flow state provider should match")
 }
 
 // TestSignupExternalUnsupported tests API /authorize for an unsupported external provider
@@ -301,4 +325,140 @@ func (ts *ExternalTestSuite) TestRedirectErrorsShouldPreserveParams() {
 			}
 		}
 	}
+}
+
+// setupGenericOAuthServer creates a mock OAuth server for testing state format handling.
+// It handles token exchange and user info endpoints for mock GitHub provider.
+func setupGenericOAuthServer(ts *ExternalTestSuite, code string) *httptest.Server {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/login/oauth/access_token":
+			ts.Equal(code, r.FormValue("code"))
+			w.Header().Add("Content-Type", "application/json")
+			fmt.Fprint(w, `{"access_token":"test_token","expires_in":100000}`)
+		case "/api/v3/user":
+			w.Header().Add("Content-Type", "application/json")
+			fmt.Fprint(w, `{"id":123,"name":"Test User","avatar_url":"http://example.com/avatar"}`)
+		case "/api/v3/user/emails":
+			w.Header().Add("Content-Type", "application/json")
+			fmt.Fprint(w, `[{"email":"test@example.com","primary":true,"verified":true}]`)
+		default:
+			w.WriteHeader(500)
+			ts.Fail("unknown oauth call %s", r.URL.Path)
+		}
+	}))
+	ts.Config.External.Github.URL = server.URL
+	return server
+}
+
+// TestOAuthState_UUIDFormat tests that the callback endpoint processes UUID state correctly.
+func (ts *ExternalTestSuite) TestOAuthState_UUIDFormat() {
+	code := "authcode"
+	server := setupGenericOAuthServer(ts, code)
+	defer server.Close()
+
+	// Use the standard authorization flow which generates UUID state
+	w := performAuthorizationRequest(ts, "github", "")
+	ts.Require().Equal(http.StatusFound, w.Code)
+	u, err := url.Parse(w.Header().Get("Location"))
+	ts.Require().NoError(err)
+
+	state := u.Query().Get("state")
+	ts.Require().NotEmpty(state)
+
+	stateUUID, err := uuid.FromString(state)
+	require.NoError(ts.T(), err, "state should be a valid UUID")
+	require.NotEqual(ts.T(), uuid.Nil, stateUUID)
+
+	testURL, err := url.Parse("http://localhost/callback")
+	require.NoError(ts.T(), err)
+	v := testURL.Query()
+	v.Set("code", code)
+	v.Set("state", state)
+	testURL.RawQuery = v.Encode()
+
+	req := httptest.NewRequest(http.MethodGet, testURL.String(), nil)
+	w = httptest.NewRecorder()
+	ts.API.handler.ServeHTTP(w, req)
+
+	ts.Require().Equal(http.StatusFound, w.Code)
+	resultURL, err := url.Parse(w.Header().Get("Location"))
+	ts.Require().NoError(err)
+
+	fragment, err := url.ParseQuery(resultURL.Fragment)
+	ts.Require().NoError(err)
+	ts.NotEmpty(fragment.Get("access_token"), "UUID state should result in access_token")
+}
+
+// TestOAuthState_InvalidFormat tests that non-UUID state parameters are rejected.
+func (ts *ExternalTestSuite) TestOAuthState_InvalidFormat() {
+	code := "authcode"
+	server := setupGenericOAuthServer(ts, code)
+	defer server.Close()
+
+	testURL, err := url.Parse("http://localhost/callback")
+	require.NoError(ts.T(), err)
+	v := testURL.Query()
+	v.Set("code", code)
+	v.Set("state", "not-a-valid-uuid")
+	testURL.RawQuery = v.Encode()
+
+	req := httptest.NewRequest(http.MethodGet, testURL.String(), nil)
+	w := httptest.NewRecorder()
+	ts.API.handler.ServeHTTP(w, req)
+
+	// Should redirect to site URL with error since state is invalid
+	ts.Require().Equal(http.StatusSeeOther, w.Code)
+}
+
+// TestPKCEFlowStateReuseRejected verifies that a PKCE flow state cannot be reused
+// after the OAuth callback has been completed
+func (ts *ExternalTestSuite) TestPKCEFlowStateReuseRejected() {
+	code := "authcode"
+	server := setupGenericOAuthServer(ts, code)
+	defer server.Close()
+
+	codeVerifier := "testtesttesttesttesttesttesttesttesttesttesttesttesttest"
+	hashedCodeVerifier := sha256.Sum256([]byte(codeVerifier))
+	codeChallenge := base64.RawURLEncoding.EncodeToString(hashedCodeVerifier[:])
+
+	// Step 1: Initiate PKCE authorization flow and extract the state parameter
+	w := performPKCEAuthorizationRequest(ts, "github", codeChallenge, "s256")
+	ts.Require().Equal(http.StatusFound, w.Code)
+	u, err := url.Parse(w.Header().Get("Location"))
+	ts.Require().NoError(err)
+	state := u.Query().Get("state")
+	ts.Require().NotEmpty(state)
+
+	// Step 2: First callback completes successfully (sets UserID on the flow state)
+	callbackURL, err := url.Parse("http://localhost/callback")
+	ts.Require().NoError(err)
+	v := callbackURL.Query()
+	v.Set("code", code)
+	v.Set("state", state)
+	callbackURL.RawQuery = v.Encode()
+
+	req := httptest.NewRequest(http.MethodGet, callbackURL.String(), nil)
+	w = httptest.NewRecorder()
+	ts.API.handler.ServeHTTP(w, req)
+	ts.Require().Equal(http.StatusFound, w.Code)
+
+	firstRedirect, err := url.Parse(w.Header().Get("Location"))
+	ts.Require().NoError(err)
+	firstQuery, err := url.ParseQuery(firstRedirect.RawQuery)
+	ts.Require().NoError(err)
+	ts.Require().NotEmpty(firstQuery.Get("code"), "first callback should return an auth code")
+
+	// Step 3: Second callback with the same state must be rejected
+	req = httptest.NewRequest(http.MethodGet, callbackURL.String(), nil)
+	w = httptest.NewRecorder()
+	ts.API.handler.ServeHTTP(w, req)
+
+	// The callback redirects errors to the redirect URL with error parameters
+	redirectURL, err := url.Parse(w.Header().Get("Location"))
+	ts.Require().NoError(err)
+	errorQuery, err := url.ParseQuery(redirectURL.RawQuery)
+	ts.Require().NoError(err)
+	ts.Contains(errorQuery.Get("error_description"), "already been used",
+		"second callback with same state should be rejected as already used")
 }

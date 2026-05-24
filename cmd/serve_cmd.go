@@ -14,6 +14,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/supabase/auth/internal/api"
+	"github.com/supabase/auth/internal/api/apilimiter"
 	"github.com/supabase/auth/internal/api/apiworker"
 	"github.com/supabase/auth/internal/conf"
 	"github.com/supabase/auth/internal/mailer/templatemailer"
@@ -63,10 +64,10 @@ func serve(ctx context.Context) {
 	defer wg.Wait() // Do not return to caller until this goroutine is done.
 
 	mrCache := templatemailer.NewCache()
-	limiterOpts := api.NewLimiterOptions(config)
+	initialLim := apilimiter.New(config)
 	initialAPI := api.NewAPIWithVersion(
 		config, db, utilities.Version,
-		limiterOpts,
+		api.WithLimiter(initialLim),
 		api.WithMailer(templatemailer.FromConfig(config, mrCache)),
 	)
 
@@ -92,11 +93,11 @@ func serve(ctx context.Context) {
 
 		var err error
 		defer func() {
-			logFn := wrkLog.Info
-			if err != nil {
-				logFn = wrkLog.WithError(err).Error
+			exitFn := wrkLog.Info
+			if err != nil && !errors.Is(err, context.Canceled) {
+				exitFn = wrkLog.WithError(err).Error
 			}
-			logFn("background apiworker is exiting")
+			exitFn("background apiworker is exiting")
 		}()
 
 		// Work exits when ctx is done as in-flight requests do not depend
@@ -124,17 +125,18 @@ func serve(ctx context.Context) {
 			var err error
 			defer func() {
 				exitFn := le.Info
-				if err != nil {
+				if err != nil && !errors.Is(err, context.Canceled) {
 					exitFn = le.WithError(err).Error
 				}
 				exitFn("config reloader is exiting")
 			}()
 
+			previousLim := initialLim
 			fn := func(latestCfg *conf.GlobalConfiguration) {
 				le.Info("reloading api with new configuration")
 
-				// When config is updated we notify the apiworker.
-				wrk.ReloadConfig(latestCfg)
+				// Update the previous limiter with the latest config
+				latestLim := previousLim.Update(le, latestCfg)
 
 				// Create a new API version with the updated config.
 				latestAPI := api.NewAPIWithVersion(
@@ -146,24 +148,26 @@ func serve(ctx context.Context) {
 					),
 
 					// Persist existing rate limiters.
-					//
-					// TODO(cstockton): we should consider updating these, if we
-					// rely on hot config reloads 100% then rate limiter changes
-					// won't be picked up.
-					limiterOpts,
+					api.WithLimiter(latestLim),
 				)
+
+				// Assign this config as the latest configuration
 				ah.Store(latestAPI)
+
+				// When config is updated we notify the apiworker.
+				wrk.ReloadConfig(latestCfg)
+
+				// Update previous limiter
+				previousLim = latestLim
 			}
 
 			rl := reloader.NewReloader(rc, watchDir)
-			if err = rl.Watch(ctx, fn); err != nil {
-				log.WithError(err).Error("config reloader is exiting")
-			}
+			err = rl.Watch(ctx, fn)
 		}()
 	}
 
 	wg.Add(1)
-	go func() {
+	go func() { // #nosec G118 -- Cleanup goroutine intentionally outlives the request; context.Background() is required for shutdown after parent context is cancelled.
 		defer wg.Done()
 
 		<-ctx.Done()
@@ -185,7 +189,7 @@ func serve(ctx context.Context) {
 		Control: func(network, address string, c syscall.RawConn) error {
 			var serr error
 			if err := c.Control(func(fd uintptr) {
-				serr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+				serr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1) // #nosec G115
 			}); err != nil {
 				return err
 			}

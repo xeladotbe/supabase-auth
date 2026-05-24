@@ -30,6 +30,7 @@ type AuthorizeParams struct {
 	Resource            string `json:"resource"`
 	CodeChallenge       string `json:"code_challenge"`
 	CodeChallengeMethod string `json:"code_challenge_method"`
+	Nonce               string `json:"nonce"` // OIDC nonce parameter
 }
 
 // AuthorizationDetailsResponse represents the response for getting authorization details
@@ -43,10 +44,10 @@ type AuthorizationDetailsResponse struct {
 
 // ClientDetailsResponse represents client details in authorization response
 type ClientDetailsResponse struct {
-	ClientID   string `json:"client_id"`
-	ClientName string `json:"client_name,omitempty"`
-	ClientURI  string `json:"client_uri,omitempty"`
-	LogoURI    string `json:"logo_uri,omitempty"`
+	ID      string `json:"id"`
+	Name    string `json:"name,omitempty"`
+	URI     string `json:"uri,omitempty"`
+	LogoURI string `json:"logo_uri,omitempty"`
 }
 
 // UserDetailsResponse represents user details in authorization response
@@ -96,6 +97,7 @@ func (s *Server) OAuthServerAuthorize(w http.ResponseWriter, r *http.Request) er
 		Resource:            query.Get("resource"),
 		CodeChallenge:       query.Get("code_challenge"),
 		CodeChallengeMethod: query.Get("code_challenge_method"),
+		Nonce:               query.Get("nonce"),
 	}
 
 	// validate basic required parameters (client_id, redirect_uri)
@@ -134,15 +136,17 @@ func (s *Server) OAuthServerAuthorize(w http.ResponseWriter, r *http.Request) er
 	}
 
 	// Store authorization request in database (without user initially)
-	authorization := models.NewOAuthServerAuthorization(
-		client.ID, // Use the client's UUID instead of the public client_id string
-		params.RedirectURI,
-		params.Scope,
-		params.State,
-		params.Resource,
-		params.CodeChallenge,
-		params.CodeChallengeMethod,
-	)
+	authorization := models.NewOAuthServerAuthorization(models.NewOAuthServerAuthorizationParams{
+		ClientID:            client.ID,
+		RedirectURI:         params.RedirectURI,
+		Scope:               params.Scope,
+		State:               params.State,
+		Resource:            params.Resource,
+		CodeChallenge:       params.CodeChallenge,
+		CodeChallengeMethod: params.CodeChallengeMethod,
+		TTL:                 config.OAuthServer.AuthorizationTTL,
+		Nonce:               params.Nonce,
+	})
 
 	if err := models.CreateOAuthServerAuthorization(db, authorization); err != nil {
 		// Error creating authorization - redirect with server_error
@@ -186,61 +190,102 @@ func (s *Server) OAuthServerGetAuthorization(w http.ResponseWriter, r *http.Requ
 	}
 
 	authorizationID := chi.URLParam(r, "authorization_id")
-	authorization, err := s.validateAndFindAuthorization(r, db, authorizationID)
+	if authorizationID == "" {
+		return apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "authorization_id is required")
+	}
+
+	var (
+		authorization     *models.OAuthServerAuthorization
+		shouldAutoApprove bool
+	)
+
+	// Lookup, user association, consent check, and optional auto-approve
+	// run under a FOR UPDATE SKIP LOCKED row lock so two concurrent callers
+	// cannot both claim the same pending authorization and each receive a
+	// valid authorization code.
+	err := db.Transaction(func(tx *storage.Connection) error {
+		auth, terr := models.FindOAuthServerAuthorizationByIDForUpdate(tx, authorizationID)
+		if terr != nil {
+			if models.IsNotFoundError(terr) {
+				return apierrors.NewNotFoundError(apierrors.ErrorCodeOAuthAuthorizationNotFound, "authorization not found")
+			}
+			return apierrors.NewInternalServerError("error finding authorization").WithInternalError(terr)
+		}
+
+		if auth.IsExpired() {
+			if merr := auth.MarkExpired(tx); merr != nil {
+				observability.GetLogEntry(r).Entry.WithError(merr).Warn("failed to mark authorization as expired")
+				return apierrors.NewNotFoundError(apierrors.ErrorCodeOAuthAuthorizationNotFound, "authorization not found")
+			}
+			// Commit the MarkExpired update but still return not-found.
+			return storage.NewCommitWithError(apierrors.NewNotFoundError(apierrors.ErrorCodeOAuthAuthorizationNotFound, "authorization not found"))
+		}
+
+		if auth.Status != models.OAuthServerAuthorizationPending {
+			return apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "authorization request cannot be processed")
+		}
+
+		if auth.UserID == nil {
+			if err := auth.SetUser(tx, user.ID); err != nil {
+				return err
+			}
+
+			existingConsent, cerr := models.FindActiveOAuthServerConsentByUserAndClient(tx, user.ID, auth.ClientID)
+			if cerr != nil {
+				return cerr
+			}
+
+			if existingConsent != nil && s.consentCoversScopes(existingConsent, auth.Scope) {
+				shouldAutoApprove = true
+			}
+		} else if *auth.UserID != user.ID {
+			observability.GetLogEntry(r).Entry.
+				WithField("request_user_id", user.ID).
+				WithField("authorization_id", auth.AuthorizationID).
+				Warn("authorization belongs to different user")
+			return apierrors.NewNotFoundError(apierrors.ErrorCodeOAuthAuthorizationNotFound, "authorization not found")
+		}
+
+		if shouldAutoApprove {
+			if err := auth.Approve(tx); err != nil {
+				return apierrors.NewInternalServerError("Error auto-approving authorization").WithInternalError(err)
+			}
+		}
+
+		authorization = auth
+		return nil
+	})
+
 	if err != nil {
 		return err
 	}
 
-	// Set user_id if not already set
-	if authorization.UserID == nil {
-		// Use transaction to atomically set user and check for auto-approve
-		var shouldAutoApprove bool
-		var existingConsent *models.OAuthServerConsent
+	observability.LogEntrySetField(r, "authorization_id", authorization.AuthorizationID)
+	observability.LogEntrySetField(r, "client_id", authorization.ClientID.String())
 
-		err := db.Transaction(func(tx *storage.Connection) error {
-			if err := authorization.SetUser(tx, user.ID); err != nil {
-				return err
-			}
-
-			// Check for existing consent and auto-approve if available
-			var err error
-			existingConsent, err = models.FindActiveOAuthServerConsentByUserAndClient(tx, user.ID, authorization.ClientID)
-			if err != nil {
-				return err
-			}
-
-			// Check if consent covers requested scopes
-			if existingConsent != nil && s.consentCoversScopes(existingConsent, authorization.Scope) {
-				shouldAutoApprove = true
-			}
-
-			return nil
+	if shouldAutoApprove {
+		observability.LogEntrySetField(r, "auto_approved", true)
+		return shared.SendJSON(w, http.StatusOK, ConsentResponse{
+			RedirectURL: s.buildSuccessRedirectURL(authorization),
 		})
-
-		if err != nil {
-			return apierrors.NewInternalServerError("error setting user and checking consent").WithInternalError(err)
-		}
-
-		// If we should auto-approve, do it now
-		if shouldAutoApprove {
-			return s.autoApproveAndRedirect(w, r, authorization)
-		}
-	} else {
-		// Authorization already has user_id set, validate ownership
-		if err := s.validateAuthorizationOwnership(r, authorization, user); err != nil {
-			return err
-		}
 	}
 
-	// Build response with client and user details
+	client, err := models.FindOAuthServerClientByID(db, authorization.ClientID)
+	if err != nil {
+		if models.IsNotFoundError(err) {
+			return apierrors.NewNotFoundError(apierrors.ErrorCodeOAuthAuthorizationNotFound, "authorization not found")
+		}
+		return apierrors.NewInternalServerError("error finding client").WithInternalError(err)
+	}
+
 	response := AuthorizationDetailsResponse{
 		AuthorizationID: authorization.AuthorizationID,
 		RedirectURI:     authorization.RedirectURI,
 		Client: ClientDetailsResponse{
-			ClientID:   authorization.Client.ID.String(),
-			ClientName: utilities.StringValue(authorization.Client.ClientName),
-			ClientURI:  utilities.StringValue(authorization.Client.ClientURI),
-			LogoURI:    utilities.StringValue(authorization.Client.LogoURI),
+			ID:      client.ID.String(),
+			Name:    utilities.StringValue(client.ClientName),
+			URI:     utilities.StringValue(client.ClientURI),
+			LogoURI: utilities.StringValue(client.LogoURI),
 		},
 		User: UserDetailsResponse{
 			ID:    user.ID.String(),
@@ -248,9 +293,6 @@ func (s *Server) OAuthServerGetAuthorization(w http.ResponseWriter, r *http.Requ
 		},
 		Scope: authorization.Scope,
 	}
-
-	observability.LogEntrySetField(r, "authorization_id", authorization.AuthorizationID)
-	observability.LogEntrySetField(r, "client_id", authorization.Client.ID.String())
 
 	return shared.SendJSON(w, http.StatusOK, response)
 }
@@ -280,24 +322,18 @@ func (s *Server) OAuthServerConsent(w http.ResponseWriter, r *http.Request) erro
 		return apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "action must be 'approve' or 'deny'")
 	}
 
-	// Validate and find authorization outside transaction first
 	authorizationID := chi.URLParam(r, "authorization_id")
 	observability.LogEntrySetField(r, "authorization_id", authorizationID)
-	authorization, err := s.validateAndFindAuthorization(r, db, authorizationID)
-	if err != nil {
-		return err
+	if authorizationID == "" {
+		return apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "authorization_id is required")
 	}
 
-	// Ensure authorization belongs to authenticated user
-	if err := s.validateAuthorizationOwnership(r, authorization, user); err != nil {
-		return err
-	}
-
-	// Process consent in transaction
+	// Row is locked FOR UPDATE SKIP LOCKED so concurrent approve/deny
+	// requests for the same authorization are serialised and the ownership
+	// check below can't race a SetUser from another request.
 	var redirectURL string
-	err = db.Transaction(func(tx *storage.Connection) error {
-		// Re-fetch in transaction to ensure consistency
-		authorization, err := models.FindOAuthServerAuthorizationByID(tx, authorizationID)
+	err := db.Transaction(func(tx *storage.Connection) error {
+		authorization, err := models.FindOAuthServerAuthorizationByIDForUpdate(tx, authorizationID)
 		if err != nil {
 			if models.IsNotFoundError(err) {
 				return apierrors.NewNotFoundError(apierrors.ErrorCodeOAuthAuthorizationNotFound, "authorization not found")
@@ -305,16 +341,25 @@ func (s *Server) OAuthServerConsent(w http.ResponseWriter, r *http.Request) erro
 			return apierrors.NewInternalServerError("error finding authorization").WithInternalError(err)
 		}
 
-		// Re-check expiration and status in transaction (state could have changed)
 		if authorization.IsExpired() {
-			if err := authorization.MarkExpired(tx); err != nil {
-				observability.GetLogEntry(r).Entry.WithError(err).Warn("failed to mark authorization as expired")
+			if merr := authorization.MarkExpired(tx); merr != nil {
+				observability.GetLogEntry(r).Entry.WithError(merr).Warn("failed to mark authorization as expired")
+				return apierrors.NewNotFoundError(apierrors.ErrorCodeOAuthAuthorizationNotFound, "authorization not found")
 			}
-			return apierrors.NewNotFoundError(apierrors.ErrorCodeOAuthAuthorizationNotFound, "authorization not found")
+			// Commit the MarkExpired update but still return not-found.
+			return storage.NewCommitWithError(apierrors.NewNotFoundError(apierrors.ErrorCodeOAuthAuthorizationNotFound, "authorization not found"))
 		}
 
 		if authorization.Status != models.OAuthServerAuthorizationPending {
 			return apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "authorization request is no longer pending")
+		}
+
+		if authorization.UserID == nil || *authorization.UserID != user.ID {
+			observability.GetLogEntry(r).Entry.
+				WithField("request_user_id", user.ID).
+				WithField("authorization_id", authorization.AuthorizationID).
+				Warn("authorization belongs to different user")
+			return apierrors.NewNotFoundError(apierrors.ErrorCodeOAuthAuthorizationNotFound, "authorization not found")
 		}
 
 		if body.Action == OAuthServerConsentActionApprove {
@@ -386,51 +431,6 @@ func (s *Server) validateRequestOrigin(r *http.Request) error {
 	return nil
 }
 
-// validateAndFindAuthorization validates the authorization_id parameter and finds the authorization,
-// performing all necessary checks (existence, expiration, status)
-func (s *Server) validateAndFindAuthorization(r *http.Request, db *storage.Connection, authorizationID string) (*models.OAuthServerAuthorization, error) {
-	if authorizationID == "" {
-		return nil, apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "authorization_id is required")
-	}
-
-	authorization, err := models.FindOAuthServerAuthorizationByID(db, authorizationID)
-	if err != nil {
-		if models.IsNotFoundError(err) {
-			return nil, apierrors.NewNotFoundError(apierrors.ErrorCodeOAuthAuthorizationNotFound, "authorization not found")
-		}
-		return nil, apierrors.NewInternalServerError("error finding authorization").WithInternalError(err)
-	}
-
-	// Check if expired first - no point processing expired authorizations
-	if authorization.IsExpired() {
-		// Mark as expired in database
-		if err := authorization.MarkExpired(db); err != nil {
-			observability.GetLogEntry(r).Entry.WithError(err).Warn("failed to mark authorization as expired")
-		}
-		// returning not found to avoid leaking information about the existence of the authorization
-		return nil, apierrors.NewNotFoundError(apierrors.ErrorCodeOAuthAuthorizationNotFound, "authorization not found")
-	}
-
-	// Check if still pending
-	if authorization.Status != models.OAuthServerAuthorizationPending {
-		return nil, apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "authorization request cannot be processed")
-	}
-
-	return authorization, nil
-}
-
-// validateAuthorizationOwnership checks if the authorization belongs to the authenticated user
-func (s *Server) validateAuthorizationOwnership(r *http.Request, authorization *models.OAuthServerAuthorization, user *models.User) error {
-	if authorization.UserID == nil || *authorization.UserID != user.ID {
-		observability.GetLogEntry(r).Entry.
-			WithField("request_user_id", user.ID).
-			WithField("authorization_id", authorization.AuthorizationID).
-			Warn("authorization belongs to different user")
-		return apierrors.NewNotFoundError(apierrors.ErrorCodeOAuthAuthorizationNotFound, "authorization not found")
-	}
-	return nil
-}
-
 // validateBasicAuthorizeParams validates only client_id and redirect_uri (needed before we can redirect errors)
 func (s *Server) validateBasicAuthorizeParams(params *AuthorizeParams) (*AuthorizeParams, error) {
 	if params.ClientID == "" {
@@ -455,6 +455,11 @@ func (s *Server) validateRemainingAuthorizeParams(params *AuthorizeParams) error
 	// OAuth 2.1 only supports "code" response type
 	if params.ResponseType != models.OAuthServerResponseTypeCode.String() {
 		return errors.New("only response_type=code is supported")
+	}
+
+	// Validate scopes
+	if err := s.validateScopes(params.Scope); err != nil {
+		return err
 	}
 
 	// Resource parameter validation (per RFC 8707)
@@ -521,6 +526,27 @@ func (s *Server) validateResourceParam(resource string) error {
 	return nil
 }
 
+// validateScopes validates the requested scopes
+func (s *Server) validateScopes(scopeString string) error {
+	if scopeString == "" {
+		return errors.New("scope parameter is required")
+	}
+
+	scopes := models.ParseScopeString(scopeString)
+	if len(scopes) == 0 {
+		return errors.New("scope parameter cannot be empty")
+	}
+
+	// Validate each scope against the centrally defined supported scopes
+	for _, scope := range scopes {
+		if !models.IsSupportedScope(scope) {
+			return fmt.Errorf("unsupported scope: %s", scope)
+		}
+	}
+
+	return nil
+}
+
 func (s *Server) isValidRedirectURI(client *models.OAuthServerClient, redirectURI string) bool {
 	registeredURIs := client.GetRedirectURIs()
 	for _, registeredURI := range registeredURIs {
@@ -539,31 +565,6 @@ func (s *Server) consentCoversScopes(consent *models.OAuthServerConsent, request
 
 	requestedScopes := models.ParseScopeString(requestedScope)
 	return consent.HasAllScopes(requestedScopes)
-}
-
-func (s *Server) autoApproveAndRedirect(w http.ResponseWriter, r *http.Request, authorization *models.OAuthServerAuthorization) error {
-	ctx := r.Context()
-	db := s.db.WithContext(ctx)
-
-	// Approve the authorization in a transaction
-	err := db.Transaction(func(tx *storage.Connection) error {
-		return authorization.Approve(tx)
-	})
-
-	if err != nil {
-		return apierrors.NewInternalServerError("Error auto-approving authorization").WithInternalError(err)
-	}
-
-	observability.LogEntrySetField(r, "authorization_id", authorization.AuthorizationID)
-	observability.LogEntrySetField(r, "auto_approved", true)
-
-	// Return JSON with redirect URL (same format as consent endpoint)
-	redirectURL := s.buildSuccessRedirectURL(authorization)
-	response := ConsentResponse{
-		RedirectURL: redirectURL,
-	}
-
-	return shared.SendJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) buildSuccessRedirectURL(authorization *models.OAuthServerAuthorization) string {

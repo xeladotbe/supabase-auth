@@ -4,10 +4,8 @@ import (
 	"bytes"
 	"crypto/subtle"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/aaronarduino/goqrsvg"
@@ -18,6 +16,7 @@ import (
 	"github.com/gofrs/uuid"
 	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
+	"github.com/sirupsen/logrus"
 	"github.com/supabase/auth/internal/api/apierrors"
 	"github.com/supabase/auth/internal/api/sms_provider"
 	"github.com/supabase/auth/internal/conf"
@@ -76,8 +75,6 @@ type WebAuthnChallengeData struct {
 }
 
 type WebAuthnParams struct {
-	RPID               string          `json:"rpId,omitempty"`
-	RPOrigins          []string        `json:"rpOrigins,omitempty"`
 	Type               string          `json:"type"` // "create" or "request"
 	CredentialResponse json.RawMessage `json:"credential_response"`
 }
@@ -86,39 +83,14 @@ type UnenrollFactorResponse struct {
 	ID uuid.UUID `json:"id"`
 }
 
-func (w *WebAuthnParams) ToConfig() (*webauthn.WebAuthn, error) {
-	if w.RPID == "" {
-		return nil, fmt.Errorf("webAuthn RP ID cannot be empty")
-	}
+func (a *API) getWebAuthnMFA() (*webauthn.WebAuthn, error) {
+	rpConfig := a.config.WebAuthn
 
-	if len(w.RPOrigins) == 0 {
-		return nil, fmt.Errorf("webAuthn RP Origins cannot be empty")
-	}
-
-	var validOrigins []string
-	var invalidOrigins []string
-
-	for _, origin := range w.RPOrigins {
-		parsedURL, err := url.Parse(origin)
-		if err != nil || (parsedURL.Scheme != "https" && !(parsedURL.Scheme == "http" && parsedURL.Hostname() == "localhost")) || parsedURL.Host == "" {
-			invalidOrigins = append(invalidOrigins, origin)
-		} else {
-			validOrigins = append(validOrigins, origin)
-		}
-	}
-
-	if len(invalidOrigins) > 0 {
-		return nil, fmt.Errorf("invalid RP origins: %s", strings.Join(invalidOrigins, ", "))
-	}
-
-	wconfig := &webauthn.Config{
-		// DisplayName is optional in spec but required to be non-empty in libary, we use the RPID as a placeholder.
-		RPDisplayName: w.RPID,
-		RPID:          w.RPID,
-		RPOrigins:     validOrigins,
-	}
-
-	return webauthn.New(wconfig)
+	return webauthn.New(&webauthn.Config{
+		RPDisplayName: rpConfig.RPDisplayName,
+		RPID:          rpConfig.RPID,
+		RPOrigins:     rpConfig.RPOrigins,
+	})
 }
 
 const (
@@ -139,7 +111,7 @@ func validateFactors(db *storage.Connection, user *models.User, newFactorName st
 		if factor.FriendlyName == newFactorName {
 			return apierrors.NewUnprocessableEntityError(
 				apierrors.ErrorCodeMFAFactorNameConflict,
-				fmt.Sprintf("A factor with the friendly name %q for this user already exists", newFactorName),
+				"A factor with the friendly name %q for this user already exists", newFactorName,
 			)
 		}
 		if factor.IsVerified() {
@@ -204,7 +176,7 @@ func (a *API) enrollPhoneFactor(w http.ResponseWriter, r *http.Request, params *
 		if terr := tx.Create(factor); terr != nil {
 			return terr
 		}
-		if terr := models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.EnrollFactorAction, r.RemoteAddr, map[string]interface{}{
+		if terr := models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.EnrollFactorAction, utilities.GetIPAddress(r), map[string]interface{}{
 			"factor_id":   factor.ID,
 			"factor_type": factor.FactorType,
 		}); terr != nil {
@@ -239,7 +211,7 @@ func (a *API) enrollWebAuthnFactor(w http.ResponseWriter, r *http.Request, param
 		if terr := tx.Create(factor); terr != nil {
 			return terr
 		}
-		if terr := models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.EnrollFactorAction, r.RemoteAddr, map[string]interface{}{
+		if terr := models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.EnrollFactorAction, utilities.GetIPAddress(r), map[string]interface{}{
 			"factor_id":   factor.ID,
 			"factor_type": factor.FactorType,
 		}); terr != nil {
@@ -308,7 +280,7 @@ func (a *API) enrollTOTPFactor(w http.ResponseWriter, r *http.Request, params *E
 			return terr
 		}
 
-		if terr := models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.EnrollFactorAction, r.RemoteAddr, map[string]interface{}{
+		if terr := models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.EnrollFactorAction, utilities.GetIPAddress(r), map[string]interface{}{
 			"factor_id": factor.ID,
 		}); terr != nil {
 			return terr
@@ -388,7 +360,7 @@ func (a *API) challengePhoneFactor(w http.ResponseWriter, r *http.Request) error
 
 	if factor.IsPhoneFactor() && factor.LastChallengedAt != nil {
 		if !factor.LastChallengedAt.Add(config.MFA.Phone.MaxFrequency).Before(time.Now()) {
-			return apierrors.NewTooManyRequestsError(apierrors.ErrorCodeOverSMSSendRateLimit, generateFrequencyLimitErrorMessage(factor.LastChallengedAt, config.MFA.Phone.MaxFrequency))
+			return apierrors.NewTooManyRequestsError(apierrors.ErrorCodeOverSMSSendRateLimit, "%s", generateFrequencyLimitErrorMessage(factor.LastChallengedAt, config.MFA.Phone.MaxFrequency))
 		}
 	}
 
@@ -407,16 +379,17 @@ func (a *API) challengePhoneFactor(w http.ResponseWriter, r *http.Request) error
 	phone := factor.Phone.String()
 
 	if config.Hook.SendSMS.Enabled {
-		input := v0hooks.SendSMSInput{
-			User: user,
-			SMS: v0hooks.SMS{
+		input := v0hooks.NewSendSMSInput(
+			r,
+			user,
+			v0hooks.SMS{
 				OTP:     otp,
 				SMSType: "mfa",
 				Phone:   phone,
 			},
-		}
+		)
 		output := v0hooks.SendSMSOutput{}
-		err := a.hooksMgr.InvokeHook(db, r, &input, &output)
+		err := a.hooksMgr.InvokeHook(db, r, input, &output)
 		if err != nil {
 			return apierrors.NewInternalServerError("error invoking hook")
 		}
@@ -435,7 +408,7 @@ func (a *API) challengePhoneFactor(w http.ResponseWriter, r *http.Request) error
 			return terr
 		}
 
-		if terr := models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.CreateChallengeAction, r.RemoteAddr, map[string]interface{}{
+		if terr := models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.CreateChallengeAction, utilities.GetIPAddress(r), map[string]interface{}{
 			"factor_id":     factor.ID,
 			"factor_status": factor.Status,
 		}); terr != nil {
@@ -467,7 +440,7 @@ func (a *API) challengeTOTPFactor(w http.ResponseWriter, r *http.Request) error 
 		if terr := factor.WriteChallengeToDatabase(tx, challenge); terr != nil {
 			return terr
 		}
-		if terr := models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.CreateChallengeAction, r.RemoteAddr, map[string]interface{}{
+		if terr := models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.CreateChallengeAction, utilities.GetIPAddress(r), map[string]interface{}{
 			"factor_id":     factor.ID,
 			"factor_status": factor.Status,
 		}); terr != nil {
@@ -498,10 +471,7 @@ func (a *API) challengeWebAuthnFactor(w http.ResponseWriter, r *http.Request) er
 	if err := retrieveRequestParams(r, params); err != nil {
 		return err
 	}
-	if params.WebAuthn == nil {
-		return apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "web_authn config required")
-	}
-	webAuthn, err := params.WebAuthn.ToConfig()
+	webAuthn, err := a.getWebAuthnMFA()
 	if err != nil {
 		return err
 	}
@@ -647,15 +617,16 @@ func (a *API) verifyTOTPFactor(w http.ResponseWriter, r *http.Request, params *V
 	})
 
 	if config.Hook.MFAVerificationAttempt.Enabled {
-		input := v0hooks.MFAVerificationAttemptInput{
-			UserID:     user.ID,
-			FactorID:   factor.ID,
-			FactorType: factor.FactorType,
-			Valid:      valid,
-		}
+		input := v0hooks.NewMFAVerificationAttemptInput(
+			r,
+			user.ID,
+			factor.ID,
+			factor.FactorType,
+			valid,
+		)
 
 		output := v0hooks.MFAVerificationAttemptOutput{}
-		err := a.hooksMgr.InvokeHook(nil, r, &input, &output)
+		err := a.hooksMgr.InvokeHook(nil, r, input, &output)
 		if err != nil {
 			return err
 		}
@@ -669,7 +640,7 @@ func (a *API) verifyTOTPFactor(w http.ResponseWriter, r *http.Request, params *V
 				output.Message = v0hooks.DefaultMFAHookRejectionMessage
 			}
 
-			return apierrors.NewForbiddenError(apierrors.ErrorCodeMFAVerificationRejected, output.Message)
+			return apierrors.NewForbiddenError(apierrors.ErrorCodeMFAVerificationRejected, "%s", output.Message)
 		}
 	}
 	if !valid {
@@ -686,10 +657,10 @@ func (a *API) verifyTOTPFactor(w http.ResponseWriter, r *http.Request, params *V
 	}
 
 	var token *AccessTokenResponse
-
+	verified := false
 	err = db.Transaction(func(tx *storage.Connection) error {
 		var terr error
-		if terr = models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.VerifyFactorAction, r.RemoteAddr, map[string]interface{}{
+		if terr = models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.VerifyFactorAction, utilities.GetIPAddress(r), map[string]interface{}{
 			"factor_id":    factor.ID,
 			"challenge_id": challenge.ID,
 			"factor_type":  factor.FactorType,
@@ -703,6 +674,7 @@ func (a *API) verifyTOTPFactor(w http.ResponseWriter, r *http.Request, params *V
 			if terr = factor.UpdateStatus(tx, models.FactorStateVerified); terr != nil {
 				return terr
 			}
+			verified = true
 		}
 		if shouldReEncrypt && config.Security.DBEncryption.Encrypt {
 			es, terr := crypto.NewEncryptedString(factor.ID.String(), []byte(secret), config.Security.DBEncryption.EncryptionKeyID, config.Security.DBEncryption.EncryptionKey)
@@ -736,6 +708,14 @@ func (a *API) verifyTOTPFactor(w http.ResponseWriter, r *http.Request, params *V
 	})
 	if err != nil {
 		return err
+	}
+
+	// Send MFA factor enrolled notification email if enabled and the factor was just verified
+	if verified && config.Mailer.Notifications.MFAFactorEnrolledEnabled && user.GetEmail() != "" {
+		if err := a.sendMFAFactorEnrolledNotification(r, db, user, factor.FactorType); err != nil {
+			// Log the error but don't fail the verification
+			logrus.WithError(err).Warn("Unable to send MFA factor enrolled notification email")
+		}
 	}
 
 	metering.RecordLogin(metering.LoginTypeMFA, user.ID, &metering.LoginData{
@@ -789,15 +769,16 @@ func (a *API) verifyPhoneFactor(w http.ResponseWriter, r *http.Request, params *
 		valid = subtle.ConstantTimeCompare([]byte(otpCode), []byte(params.Code)) == 1
 	}
 	if config.Hook.MFAVerificationAttempt.Enabled {
-		input := v0hooks.MFAVerificationAttemptInput{
-			UserID:     user.ID,
-			FactorID:   factor.ID,
-			FactorType: factor.FactorType,
-			Valid:      valid,
-		}
+		input := v0hooks.NewMFAVerificationAttemptInput(
+			r,
+			user.ID,
+			factor.ID,
+			factor.FactorType,
+			valid,
+		)
 
 		output := v0hooks.MFAVerificationAttemptOutput{}
-		err := a.hooksMgr.InvokeHook(nil, r, &input, &output)
+		err := a.hooksMgr.InvokeHook(nil, r, input, &output)
 		if err != nil {
 			return err
 		}
@@ -811,7 +792,7 @@ func (a *API) verifyPhoneFactor(w http.ResponseWriter, r *http.Request, params *
 				output.Message = v0hooks.DefaultMFAHookRejectionMessage
 			}
 
-			return apierrors.NewForbiddenError(apierrors.ErrorCodeMFAVerificationRejected, output.Message)
+			return apierrors.NewForbiddenError(apierrors.ErrorCodeMFAVerificationRejected, "%s", output.Message)
 		}
 	}
 	if !valid {
@@ -828,10 +809,10 @@ func (a *API) verifyPhoneFactor(w http.ResponseWriter, r *http.Request, params *
 	}
 
 	var token *AccessTokenResponse
-
+	verified := false
 	err = db.Transaction(func(tx *storage.Connection) error {
 		var terr error
-		if terr = models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.VerifyFactorAction, r.RemoteAddr, map[string]interface{}{
+		if terr = models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.VerifyFactorAction, utilities.GetIPAddress(r), map[string]interface{}{
 			"factor_id":    factor.ID,
 			"challenge_id": challenge.ID,
 			"factor_type":  factor.FactorType,
@@ -845,6 +826,7 @@ func (a *API) verifyPhoneFactor(w http.ResponseWriter, r *http.Request, params *
 			if terr = factor.UpdateStatus(tx, models.FactorStateVerified); terr != nil {
 				return terr
 			}
+			verified = true
 		}
 		user, terr = models.FindUserByID(tx, user.ID)
 		if terr != nil {
@@ -867,6 +849,14 @@ func (a *API) verifyPhoneFactor(w http.ResponseWriter, r *http.Request, params *
 	})
 	if err != nil {
 		return err
+	}
+
+	// Send MFA factor enrolled notification email if enabled and the factor was just verified
+	if verified && config.Mailer.Notifications.MFAFactorEnrolledEnabled && user.GetEmail() != "" {
+		if err := a.sendMFAFactorEnrolledNotification(r, db, user, factor.FactorType); err != nil {
+			// Log the error but don't fail the verification
+			logrus.WithError(err).Warn("Unable to send MFA factor enrolled notification email")
+		}
 	}
 
 	metering.RecordLogin(metering.LoginTypeMFA, user.ID, &metering.LoginData{
@@ -895,7 +885,7 @@ func (a *API) verifyWebAuthnFactor(w http.ResponseWriter, r *http.Request, param
 	case params.WebAuthn.CredentialResponse == nil:
 		return apierrors.NewBadRequestError(apierrors.ErrorCodeValidationFailed, "credential_response required")
 	default:
-		webAuthn, err = params.WebAuthn.ToConfig()
+		webAuthn, err = a.getWebAuthnMFA()
 		if err != nil {
 			return err
 		}
@@ -935,9 +925,10 @@ func (a *API) verifyWebAuthnFactor(w http.ResponseWriter, r *http.Request, param
 		return apierrors.NewInternalServerError("Database error deleting challenge").WithInternalError(err)
 	}
 	var token *AccessTokenResponse
+	verified := false
 	err = db.Transaction(func(tx *storage.Connection) error {
 		var terr error
-		if terr = models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.VerifyFactorAction, r.RemoteAddr, map[string]interface{}{
+		if terr = models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.VerifyFactorAction, utilities.GetIPAddress(r), map[string]interface{}{
 			"factor_id":    factor.ID,
 			"challenge_id": challenge.ID,
 			"factor_type":  factor.FactorType,
@@ -952,6 +943,7 @@ func (a *API) verifyWebAuthnFactor(w http.ResponseWriter, r *http.Request, param
 			if terr = factor.SaveWebAuthnCredential(tx, credential); terr != nil {
 				return terr
 			}
+			verified = true
 		}
 
 		if terr = factor.UpdateLastWebAuthnChallenge(tx, challenge, params.WebAuthn.Type, parsedResponse); terr != nil {
@@ -977,6 +969,14 @@ func (a *API) verifyWebAuthnFactor(w http.ResponseWriter, r *http.Request, param
 	})
 	if err != nil {
 		return err
+	}
+
+	// Send MFA factor enrolled notification email if enabled and the factor was just verified
+	if verified && config.Mailer.Notifications.MFAFactorEnrolledEnabled && user.GetEmail() != "" {
+		if err := a.sendMFAFactorEnrolledNotification(r, db, user, factor.FactorType); err != nil {
+			// Log the error but don't fail the verification
+			logrus.WithError(err).Warn("Unable to send MFA factor enrolled notification email")
+		}
 	}
 
 	metering.RecordLogin(metering.LoginTypeMFA, user.ID, &metering.LoginData{
@@ -1039,12 +1039,14 @@ func (a *API) UnenrollFactor(w http.ResponseWriter, r *http.Request) error {
 		return apierrors.NewUnprocessableEntityError(apierrors.ErrorCodeInsufficientAAL, "AAL2 required to unenroll verified factor")
 	}
 
+	factorType := factor.FactorType
+
 	err = db.Transaction(func(tx *storage.Connection) error {
 		var terr error
 		if terr := tx.Destroy(factor); terr != nil {
 			return terr
 		}
-		if terr = models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.UnenrollFactorAction, r.RemoteAddr, map[string]interface{}{
+		if terr = models.NewAuditLogEntry(config.AuditLog, r, tx, user, models.UnenrollFactorAction, utilities.GetIPAddress(r), map[string]interface{}{
 			"factor_id":     factor.ID,
 			"factor_status": factor.Status,
 			"session_id":    session.ID,
@@ -1058,6 +1060,14 @@ func (a *API) UnenrollFactor(w http.ResponseWriter, r *http.Request) error {
 	})
 	if err != nil {
 		return err
+	}
+
+	// Send MFA factor unenrolled notification email if enabled
+	if config.Mailer.Notifications.MFAFactorUnenrolledEnabled && user.GetEmail() != "" {
+		if err := a.sendMFAFactorUnenrolledNotification(r, db, user, factorType); err != nil {
+			// Log the error but don't fail the unenrollment
+			logrus.WithError(err).Warn("Unable to send MFA factor unenrolled notification email")
+		}
 	}
 
 	return sendJSON(w, http.StatusOK, &UnenrollFactorResponse{
